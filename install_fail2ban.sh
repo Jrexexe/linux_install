@@ -2,7 +2,7 @@
 # ============================================================
 #  Fail2ban 安装与严格封禁策略配置脚本
 #  适用：CentOS 7 / 8 / Stream
-#  作者：sysadmin  用法：sudo bash install_fail2ban.sh
+#  用法：sudo bash install_fail2ban.sh
 # ============================================================
 set -euo pipefail
 
@@ -50,15 +50,15 @@ fi
 info "写入严格封禁策略配置..."
 cat > /etc/fail2ban/jail.local << 'JAILEOF'
 [DEFAULT]
-# 白名单：本机回环 + 内网（按实际修改）
+# 白名单：本机回环 + 内网（按实际环境修改）
 ignoreip = 127.0.0.1/8 ::1 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16
 
 # ── 封禁时长策略（严格递增）──────────────────────────────
 # 首次封禁 1 小时，每次被封再乘 2，上限 30 天
-bantime         = 3600
-bantime.increment = true
-bantime.factor  = 2
-bantime.maxtime = 2592000
+bantime          = 3600
+bantime.increment  = true
+bantime.factor     = 2
+bantime.maxtime    = 2592000
 bantime.overalljails = true
 
 # 检测窗口：10 分钟内超过阈值即封禁
@@ -70,10 +70,13 @@ maxretry  = 3
 # 后端（由脚本自动替换）
 backend   = BACKEND_PLACEHOLDER
 
-# 动作：封禁 + 发送告警邮件（无邮件服务器则用 %(action_)s）
+# 动作：封禁 + 发送告警邮件（无邮件服务器则改为 %(action_)s）
 action    = %(action_mwl)s
 
-# 日志编码
+# 收件人（配置邮件时修改）
+destemail = root@localhost
+sendername = Fail2Ban Alert
+
 encoding  = UTF-8
 
 # ── SSH 防爆破（主要 jail）────────────────────────────────
@@ -87,7 +90,7 @@ maxretry  = 3
 findtime  = 300
 bantime   = 7200
 
-# ── SSH 反复探测加强版（更长封禁）────────────────────────
+# ── SSH DDoS 级探测加强版（更激进策略）───────────────────
 [sshd-ddos]
 enabled   = true
 port      = ssh
@@ -97,7 +100,7 @@ maxretry  = 2
 findtime  = 60
 bantime   = 86400
 
-# ── 端口扫描封禁（需要 portscan filter）──────────────────
+# ── 端口扫描封禁（需要自定义 portscan filter）─────────────
 [portscan]
 enabled   = false
 filter    = portscan
@@ -106,14 +109,16 @@ maxretry  = 5
 findtime  = 60
 bantime   = 86400
 
-# ── Web 服务（可选，nginx 安装后启用）────────────────────
+# ── Nginx 认证失败（安装 nginx 后启用）───────────────────
 [nginx-http-auth]
 enabled  = false
 port     = http,https
 filter   = nginx-http-auth
 logpath  = /var/log/nginx/error.log
 maxretry = 3
+bantime  = 3600
 
+# ── Nginx 限速触发 ────────────────────────────────────────
 [nginx-limit-req]
 enabled  = false
 port     = http,https
@@ -122,19 +127,38 @@ logpath  = /var/log/nginx/error.log
 maxretry = 5
 findtime = 60
 bantime  = 3600
+
+# ── MySQL 暴力破解 ────────────────────────────────────────
+[mysqld-auth]
+enabled  = false
+port     = 3306
+filter   = mysqld-auth
+logpath  = /var/log/mysqld.log
+maxretry = 3
+bantime  = 86400
 JAILEOF
 
-# 替换后端占位符
+# 替换防火墙后端占位符
 sed -i "s/BACKEND_PLACEHOLDER/$BACKEND/" /etc/fail2ban/jail.local
 
 # ── 6. 写入自定义 portscan filter ─────────────────────────
+info "写入 portscan filter..."
 cat > /etc/fail2ban/filter.d/portscan.conf << 'FILTEREOF'
 [Definition]
-failregex = kernel: .*IN=.* OUT= .* SRC= DPT=(22|23|25|80|110|443|3306|6379|27017)
+# 匹配内核防火墙日志中的常见端口探测行为
+failregex = kernel: .*IN=.* OUT= .* SRC=<HOST> DPT=(22|23|25|80|110|443|3306|6379|27017)
 ignoreregex =
 FILTEREOF
 
-# ── 7. 配置 fail2ban 日志 ─────────────────────────────────
+# ── 7. 写入 Web 扫描器封禁 filter ─────────────────────────
+cat > /etc/fail2ban/filter.d/custom-web-scan.conf << 'WSCANEOF'
+[Definition]
+# 拦截常见 Web 漏洞扫描器特征（Nginx access.log）
+failregex = ^<HOST> -.*"(GET|POST).*(\.php\?|wp-login|xmlrpc|eval\(|union.*select|/etc/passwd).*" (400|401|403|404|500)
+ignoreregex = Googlebot|bingbot|Baiduspider
+WSCANEOF
+
+# ── 8. 配置 fail2ban 自身日志 ─────────────────────────────
 mkdir -p /var/log/fail2ban
 cat > /etc/fail2ban/fail2ban.local << 'LOGEOF'
 [Definition]
@@ -142,15 +166,15 @@ loglevel  = INFO
 logtarget = /var/log/fail2ban/fail2ban.log
 LOGEOF
 
-# ── 8. 启动并设置开机自启 ─────────────────────────────────
-info "启动 fail2ban..."
+# ── 9. 启动并设置开机自启 ─────────────────────────────────
+info "启动 fail2ban 服务..."
 systemctl daemon-reload
 systemctl enable --now fail2ban
 
 sleep 3
 
-# ── 9. 验证状态 ───────────────────────────────────────────
-info "验证安装..."
+# ── 10. 验证运行状态 ──────────────────────────────────────
+info "验证安装状态..."
 if systemctl is-active --quiet fail2ban; then
     info "fail2ban 运行正常 ✓"
     fail2ban-client status
@@ -158,19 +182,39 @@ else
     error "fail2ban 启动失败，请检查：journalctl -u fail2ban -n 50"
 fi
 
-# ── 10. 打印摘要 ──────────────────────────────────────────
+# ── 11. 输出摘要 ──────────────────────────────────────────
 echo ""
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo "  Fail2ban 安装完成 — 封禁策略摘要"
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo "  SSH 最大失败次数 : 3 次 / 5 分钟"
-echo "  首次封禁时长     : 2 小时"
-echo "  递增封禁上限     : 30 天"
-echo "  DDoS 探测封禁    : 2 次 / 60 秒 → 封禁 24 小时"
-echo "  防火墙后端       : $BACKEND"
-echo "  配置文件         : /etc/fail2ban/jail.local"
-echo "  日志文件         : /var/log/fail2ban/fail2ban.log"
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo "  白名单修改：编辑 /etc/fail2ban/jail.local → ignoreip"
-echo "  重载配置  ：fail2ban-client reload"
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo ""
+echo "  jail          | maxretry | findtime | bantime"
+echo "  ─────────────────────────────────────────────────────"
+echo "  sshd          |   3 次   |  5 分钟  | 首次 2h，递增×2"
+echo "  sshd-ddos     |   2 次   | 60 秒    | 24 小时"
+echo "  DEFAULT       |   3 次   | 10 分钟  | 首次 1h，递增×2，上限30天"
+echo ""
+echo "  递增封禁时间表（bantime.factor=2）："
+echo "    第 1 次 →  1 小时"
+echo "    第 2 次 →  2 小时"
+echo "    第 3 次 →  4 小时"
+echo "    第 4 次 →  8 小时"
+echo "    第 5 次 → 16 小时"
+echo "    第 6 次 → 30 天（上限）"
+echo ""
+echo "  防火墙后端   : $BACKEND"
+echo "  配置文件     : /etc/fail2ban/jail.local"
+echo "  日志文件     : /var/log/fail2ban/fail2ban.log"
+echo ""
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo "  常用命令："
+echo "    查看状态  : fail2ban-client status sshd"
+echo "    解封 IP   : fail2ban-client set sshd unbanip <IP>"
+echo "    重载配置  : fail2ban-client reload"
+echo "    实时日志  : tail -f /var/log/fail2ban/fail2ban.log"
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo ""
+echo "  [!] 请确认 ignoreip 中已包含您的管理 IP，避免误封！"
+echo "      编辑：/etc/fail2ban/jail.local → ignoreip"
+echo "      修改后执行：fail2ban-client reload"
+echo ""
