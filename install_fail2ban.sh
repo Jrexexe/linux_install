@@ -1,9 +1,10 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # ============================================================
-#  Fail2ban 安装与严格封禁策略配置脚本
-#  适用：CentOS 7 / 8 / Stream
-#  用法：sudo bash install_fail2ban.sh
+# Fail2ban 安装与严格封禁策略（阿里云优化版，无邮件）
+# 适用：CentOS / Rocky / Alma / Alibaba Cloud Linux
+# 用法：sudo bash install_fail2ban.sh
 # ============================================================
+
 set -euo pipefail
 
 RED='\033[0;31m'; GRN='\033[0;32m'; YLW='\033[1;33m'; NC='\033[0m'
@@ -13,208 +14,122 @@ error() { echo -e "${RED}[ERROR]${NC} $*"; exit 1; }
 
 [[ $EUID -ne 0 ]] && error "请使用 root 或 sudo 运行"
 
-# ── 1. 检测发行版 ──────────────────────────────────────────
-if   [[ -f /etc/centos-release ]]; then OS="centos"
-elif [[ -f /etc/redhat-release ]]; then OS="rhel"
-else error "不支持的发行版"; fi
-VER=$(rpm -E '%{rhel}')
-info "检测到 $OS $VER"
+# ── 1. 识别系统 ─────────────────────────────────────────────
+info "识别系统..."
+source /etc/os-release
+OS=$ID
+VER_ID=${VERSION_ID%%.*}
+info "系统: $OS $VER_ID"
 
-# ── 2. 安装 EPEL ───────────────────────────────────────────
-info "安装 EPEL 源..."
-if [[ "$VER" -eq 7 ]]; then
-    yum install -y epel-release
-elif [[ "$VER" -ge 8 ]]; then
-    dnf install -y epel-release
-    dnf config-manager --set-enabled epel 2>/dev/null || true
+# ── 2. 安装 EPEL ────────────────────────────────────────────
+info "安装 EPEL..."
+if ! rpm -qa | grep -q epel-release; then
+    rpm -Uvh --quiet https://dl.fedoraproject.org/pub/epel/epel-release-latest-${VER_ID}.noarch.rpm || warn "EPEL 安装可能失败"
 fi
 
 # ── 3. 安装 fail2ban ───────────────────────────────────────
 info "安装 fail2ban..."
-if [[ "$VER" -eq 7 ]]; then
-    yum install -y fail2ban fail2ban-systemd
-else
+if command -v dnf >/dev/null 2>&1; then
     dnf install -y fail2ban fail2ban-systemd
-fi
-
-# ── 4. 检测防火墙后端 ─────────────────────────────────────
-if systemctl is-active --quiet firewalld; then
-    BACKEND="firewallcmd-ipset"
-    info "检测到 firewalld，使用 firewallcmd-ipset 后端"
 else
-    BACKEND="iptables-multiport"
-    warn "未检测到 firewalld，使用 iptables 后端"
+    yum install -y fail2ban fail2ban-systemd
 fi
 
-# ── 5. 写入 /etc/fail2ban/jail.local ─────────────────────
-info "写入严格封禁策略配置..."
-cat > /etc/fail2ban/jail.local << 'JAILEOF'
+# ── 4. 确保 firewalld ──────────────────────────────────────
+info "配置 firewalld..."
+if ! systemctl is-enabled firewalld >/dev/null 2>&1; then
+    if command -v dnf >/dev/null; then
+        dnf install -y firewalld
+    else
+        yum install -y firewalld
+    fi
+    systemctl enable --now firewalld
+fi
+
+BACKEND="firewallcmd-ipset"
+
+# ── 5. 写配置 ─────────────────────────────────────────────
+info "写入 jail.local..."
+
+cat > /etc/fail2ban/jail.local <<EOF
 [DEFAULT]
-# 白名单：本机回环 + 内网（按实际环境修改）
-ignoreip = 127.0.0.1/8 ::1 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16
+ignoreip = 127.0.0.1/8 ::1
 
-# ── 封禁时长策略（严格递增）──────────────────────────────
-# 首次封禁 1 小时，每次被封再乘 2，上限 30 天
-bantime          = 3600
-bantime.increment  = true
-bantime.factor     = 2
-bantime.maxtime    = 2592000
-bantime.overalljails = true
+# 封禁策略
+bantime = 3600
+bantime.increment = true
+bantime.factor = 2
+bantime.maxtime = 864000
 
-# 检测窗口：10 分钟内超过阈值即封禁
-findtime  = 600
+findtime = 600
+maxretry = 5
 
-# 最大失败次数（严格：3 次）
-maxretry  = 3
+backend = systemd
 
-# 后端（由脚本自动替换）
-backend   = BACKEND_PLACEHOLDER
+# ❗ 不使用邮件
+action = %(action_)s
 
-# 动作：封禁 + 发送告警邮件（无邮件服务器则改为 %(action_)s）
-action    = %(action_mwl)s
-
-# 收件人（配置邮件时修改）
-destemail = root@localhost
-sendername = Fail2Ban Alert
-
-encoding  = UTF-8
-
-# ── SSH 防爆破（主要 jail）────────────────────────────────
+# ── SSH 基础防护 ─────────────────
 [sshd]
 enabled   = true
 port      = ssh
 filter    = sshd
-logpath   = %(sshd_log)s
-backend   = %(sshd_backend)s
-maxretry  = 3
+backend   = systemd
+maxretry  = 5
 findtime  = 300
-bantime   = 7200
+bantime   = 3600
 
-# ── SSH DDoS 级探测加强版（更激进策略）───────────────────
+# ── SSH 激进防护（防扫描）────────
 [sshd-ddos]
 enabled   = true
 port      = ssh
 filter    = sshd-ddos
-logpath   = %(sshd_log)s
-maxretry  = 2
+backend   = systemd
+maxretry  = 3
 findtime  = 60
 bantime   = 86400
+EOF
 
-# ── 端口扫描封禁（需要自定义 portscan filter）─────────────
-[portscan]
-enabled   = false
-filter    = portscan
-logpath   = /var/log/messages
-maxretry  = 5
-findtime  = 60
-bantime   = 86400
-
-# ── Nginx 认证失败（安装 nginx 后启用）───────────────────
-[nginx-http-auth]
-enabled  = false
-port     = http,https
-filter   = nginx-http-auth
-logpath  = /var/log/nginx/error.log
-maxretry = 3
-bantime  = 3600
-
-# ── Nginx 限速触发 ────────────────────────────────────────
-[nginx-limit-req]
-enabled  = false
-port     = http,https
-filter   = nginx-limit-req
-logpath  = /var/log/nginx/error.log
-maxretry = 5
-findtime = 60
-bantime  = 3600
-
-# ── MySQL 暴力破解 ────────────────────────────────────────
-[mysqld-auth]
-enabled  = false
-port     = 3306
-filter   = mysqld-auth
-logpath  = /var/log/mysqld.log
-maxretry = 3
-bantime  = 86400
-JAILEOF
-
-# 替换防火墙后端占位符
-sed -i "s/BACKEND_PLACEHOLDER/$BACKEND/" /etc/fail2ban/jail.local
-
-# ── 6. 写入自定义 portscan filter ─────────────────────────
-info "写入 portscan filter..."
-cat > /etc/fail2ban/filter.d/portscan.conf << 'FILTEREOF'
-[Definition]
-# 匹配内核防火墙日志中的常见端口探测行为
-failregex = kernel: .*IN=.* OUT= .* SRC=<HOST> DPT=(22|23|25|80|110|443|3306|6379|27017)
-ignoreregex =
-FILTEREOF
-
-# ── 7. 写入 Web 扫描器封禁 filter ─────────────────────────
-cat > /etc/fail2ban/filter.d/custom-web-scan.conf << 'WSCANEOF'
-[Definition]
-# 拦截常见 Web 漏洞扫描器特征（Nginx access.log）
-failregex = ^<HOST> -.*"(GET|POST).*(\.php\?|wp-login|xmlrpc|eval\(|union.*select|/etc/passwd).*" (400|401|403|404|500)
-ignoreregex = Googlebot|bingbot|Baiduspider
-WSCANEOF
-
-# ── 8. 配置 fail2ban 自身日志 ─────────────────────────────
+# ── 6. 日志配置 ────────────────────────────────────────────
 mkdir -p /var/log/fail2ban
-cat > /etc/fail2ban/fail2ban.local << 'LOGEOF'
-[Definition]
-loglevel  = INFO
-logtarget = /var/log/fail2ban/fail2ban.log
-LOGEOF
 
-# ── 9. 启动并设置开机自启 ─────────────────────────────────
-info "启动 fail2ban 服务..."
-systemctl daemon-reload
+cat > /etc/fail2ban/fail2ban.local <<EOF
+[Definition]
+loglevel = INFO
+logtarget = /var/log/fail2ban/fail2ban.log
+EOF
+
+# ── 7. 启动 ───────────────────────────────────────────────
+info "启动 fail2ban..."
+systemctl daemon-reexec
 systemctl enable --now fail2ban
 
-sleep 3
+sleep 2
 
-# ── 10. 验证运行状态 ──────────────────────────────────────
-info "验证安装状态..."
-if systemctl is-active --quiet fail2ban; then
+# ── 8. 验证 ───────────────────────────────────────────────
+if fail2ban-client ping | grep -q pong; then
     info "fail2ban 运行正常 ✓"
-    fail2ban-client status
 else
-    error "fail2ban 启动失败，请检查：journalctl -u fail2ban -n 50"
+    error "fail2ban 启动失败，请检查日志"
 fi
 
-# ── 11. 输出摘要 ──────────────────────────────────────────
+# ── 9. 输出 ───────────────────────────────────────────────
 echo ""
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo "  Fail2ban 安装完成 — 封禁策略摘要"
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo " Fail2ban 已部署完成"
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo ""
-echo "  jail          | maxretry | findtime | bantime"
-echo "  ─────────────────────────────────────────────────────"
-echo "  sshd          |   3 次   |  5 分钟  | 首次 2h，递增×2"
-echo "  sshd-ddos     |   2 次   | 60 秒    | 24 小时"
-echo "  DEFAULT       |   3 次   | 10 分钟  | 首次 1h，递增×2，上限30天"
+echo "查看状态："
+echo "  fail2ban-client status"
 echo ""
-echo "  递增封禁时间表（bantime.factor=2）："
-echo "    第 1 次 →  1 小时"
-echo "    第 2 次 →  2 小时"
-echo "    第 3 次 →  4 小时"
-echo "    第 4 次 →  8 小时"
-echo "    第 5 次 → 16 小时"
-echo "    第 6 次 → 30 天（上限）"
+echo "查看 SSH："
+echo "  fail2ban-client status sshd"
 echo ""
-echo "  防火墙后端   : $BACKEND"
-echo "  配置文件     : /etc/fail2ban/jail.local"
-echo "  日志文件     : /var/log/fail2ban/fail2ban.log"
+echo "解封 IP："
+echo "  fail2ban-client set sshd unbanip <IP>"
 echo ""
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo "  常用命令："
-echo "    查看状态  : fail2ban-client status sshd"
-echo "    解封 IP   : fail2ban-client set sshd unbanip <IP>"
-echo "    重载配置  : fail2ban-client reload"
-echo "    实时日志  : tail -f /var/log/fail2ban/fail2ban.log"
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo "日志："
+echo "  tail -f /var/log/fail2ban/fail2ban.log"
 echo ""
-echo "  [!] 请确认 ignoreip 中已包含您的管理 IP，避免误封！"
-echo "      编辑：/etc/fail2ban/jail.local → ignoreip"
-echo "      修改后执行：fail2ban-client reload"
-echo ""
+echo "⚠️ 建议：把你的公网IP加入 ignoreip 防止误封"
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
